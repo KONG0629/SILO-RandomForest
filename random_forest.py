@@ -1,41 +1,41 @@
-# ============================================================
-# CELL 1: INSTALL AND IMPORT LIBRARIES
-# ============================================================
-# Run this cell once whenever a new Colab runtime starts.
+"""S.I.L.O. Analytics: automated 10-minute Random Forest forecasts.
 
+GitHub Actions reads sensor history from Supabase, trains time-aware models,
+publishes one forecast per storage, and publishes active fan-control rules.
+"""
 
 import os
-import time
+import sys
 import warnings
 from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
 import requests
-
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
-from sklearn.metrics import accuracy_score, classification_report, f1_score, mean_absolute_error
+from sklearn.metrics import accuracy_score, f1_score, mean_absolute_error
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
 
 warnings.filterwarnings("ignore", category=UserWarning)
-print("✅ Libraries loaded.")
 
-# ============================================================
-# CONFIGURATION FOR GITHUB ACTIONS
-# ============================================================
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
-SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
+# ----------------------------- Configuration -----------------------------
+
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
-    raise ValueError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY in GitHub Actions Secrets.")
+    raise RuntimeError(
+        "Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY. "
+        "Add both values to GitHub repository Actions secrets."
+    )
 
-DEVICE_ID = "ESP32_SILO_001"
+DEVICE_ID = os.getenv("SILO_DEVICE_ID", "ESP32_SILO_001")
 SENSOR_TABLE = "sensordata"
 PREDICTIONS_TABLE = "predictions"
 MODEL_RULES_TABLE = "model_rules"
-STORAGE_NUMBERS = [1, 2, 3]
+STORAGE_NUMBERS = (1, 2, 3)
 
 FORECAST_MINUTES = 10
 FORECAST_TOLERANCE_MINUTES = 4
@@ -43,12 +43,28 @@ MAX_SOURCE_ROWS = 50_000
 PAGE_SIZE = 1_000
 MAX_LATEST_AGE_MINUTES = 30
 MIN_TRAINING_PAIRS = 30
-MIN_CLASS_COUNT_FOR_TEST = 2
 RANDOM_STATE = 42
 
 SENSOR_COLUMNS = ["temperature", "humidity", "mq135_raw"]
-FEATURE_COLUMNS = ["storage_no", "temperature", "humidity", "mq135_raw", "temperature_delta", "humidity_delta", "mq135_delta"]
-VALID_LABELS = ["normal", "warning", "critical"]
+FEATURE_COLUMNS = [
+    "storage_no",
+    "temperature",
+    "humidity",
+    "mq135_raw",
+    "temperature_delta",
+    "humidity_delta",
+    "mq135_delta",
+]
+RISK_ORDER = {"safe": 0, "warning": 1, "critical": 2}
+
+DEFAULT_RULES = {
+    "temperature_on": 30.0,
+    "temperature_off": 28.0,
+    "humidity_on": 70.0,
+    "humidity_off": 65.0,
+    "mq135_on": 1500.0,
+    "mq135_off": 1300.0,
+}
 
 HEADERS = {
     "apikey": SUPABASE_KEY,
@@ -56,34 +72,54 @@ HEADERS = {
     "Content-Type": "application/json",
 }
 
-print("✅ Configuration loaded for", DEVICE_ID)
 
-# ============================================================
-# CELL 3: SUPABASE REST HELPERS AND PAGINATED SENSOR FETCH
-# ============================================================
+# ----------------------------- Supabase REST -----------------------------
 
-def supabase_request(method, table, *, params=None, payload=None, prefer=None, timeout=30):
+def supabase_request(method, table, *, params=None, payload=None, prefer=None):
     headers = dict(HEADERS)
     if prefer:
         headers["Prefer"] = prefer
-    response = requests.request(
-        method,
-        f"{SUPABASE_URL}/rest/v1/{table}",
-        headers=headers,
-        params=params,
-        json=payload,
-        timeout=timeout,
-    )
-    if not response.ok:
-        body = response.text[:1000]
-        raise RuntimeError(f"Supabase {method} {table} failed ({response.status_code}): {body}")
-    if response.status_code == 204 or not response.text.strip():
-        return []
-    return response.json()
+
+    last_error = None
+    for attempt in range(1, 4):
+        try:
+            response = requests.request(
+                method,
+                f"{SUPABASE_URL}/rest/v1/{table}",
+                headers=headers,
+                params=params,
+                json=payload,
+                timeout=(10, 60),
+            )
+            if response.ok:
+                if response.status_code == 204 or not response.text.strip():
+                    return []
+                return response.json()
+
+            body = response.text[:1000]
+            last_error = RuntimeError(
+                f"Supabase {method} {table} failed "
+                f"({response.status_code}): {body}"
+            )
+            # Retrying invalid requests or authentication failures will not help.
+            if response.status_code < 500 and response.status_code != 429:
+                raise last_error
+        except requests.RequestException as error:
+            last_error = error
+
+        if attempt < 3:
+            import time
+            time.sleep(2 ** (attempt - 1))
+
+    raise RuntimeError(f"Supabase request failed after 3 attempts: {last_error}")
 
 
 def fetch_sensor_data():
-    selected = "id,device_id,storage_no,temperature,humidity,mq135_raw,risk_label,created_at"
+    """Fetch the newest MAX_SOURCE_ROWS, then restore chronological order."""
+    selected = (
+        "id,device_id,storage_no,temperature,humidity,"
+        "mq135_raw,risk_label,created_at"
+    )
     rows = []
 
     for offset in range(0, MAX_SOURCE_ROWS, PAGE_SIZE):
@@ -93,7 +129,7 @@ def fetch_sensor_data():
             params={
                 "device_id": f"eq.{DEVICE_ID}",
                 "select": selected,
-                "order": "created_at.asc,id.asc",
+                "order": "created_at.desc,id.desc",
                 "limit": PAGE_SIZE,
                 "offset": offset,
             },
@@ -102,92 +138,113 @@ def fetch_sensor_data():
         if len(page) < PAGE_SIZE:
             break
 
-    if len(rows) == MAX_SOURCE_ROWS:
-        print(f"⚠️ Reached MAX_SOURCE_ROWS={MAX_SOURCE_ROWS}; older/newer coverage depends on query order.")
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        return frame
 
-    df = pd.DataFrame(rows)
-    if df.empty:
-        print("⚠️ No sensor data found.")
-        return df
+    print(f"Downloaded {len(frame):,} newest sensor rows.")
+    return frame
 
-    print(f"✅ Downloaded {len(df):,} sensor rows.")
-    print(df["storage_no"].value_counts(dropna=False).sort_index())
-    return df
 
-# ============================================================
-# CELL 4: CLEAN DATA AND BUILD TRUE T+10-MINUTE TRAINING PAIRS
-# ============================================================
+# -------------------------- Cleaning and pairing --------------------------
 
-def clean_sensor_data(df):
-    required = {"id", "storage_no", "temperature", "humidity", "mq135_raw", "risk_label", "created_at"}
-    missing = sorted(required.difference(df.columns))
+def clean_sensor_data(frame):
+    required = {
+        "id", "storage_no", "temperature", "humidity",
+        "mq135_raw", "risk_label", "created_at",
+    }
+    missing = sorted(required.difference(frame.columns))
     if missing:
         raise ValueError(f"Missing columns in {SENSOR_TABLE}: {missing}")
 
-    clean = df.copy()
+    clean = frame.copy()
+    clean["id"] = pd.to_numeric(clean["id"], errors="coerce")
     for column in ["storage_no", *SENSOR_COLUMNS]:
         clean[column] = pd.to_numeric(clean[column], errors="coerce")
-    clean["created_at"] = pd.to_datetime(clean["created_at"], utc=True, errors="coerce")
-    clean["risk_label"] = clean["risk_label"].astype(str).str.strip().str.lower()
-    clean = clean.dropna(subset=["id", "storage_no", *SENSOR_COLUMNS, "risk_label", "created_at"])
+    clean["created_at"] = pd.to_datetime(
+        clean["created_at"], utc=True, errors="coerce"
+    )
+    clean["risk_label"] = (
+        clean["risk_label"].astype("string").str.strip().str.lower()
+        .replace({"normal": "safe"})
+    )
+
+    clean = clean.dropna(
+        subset=["id", "storage_no", *SENSOR_COLUMNS, "risk_label", "created_at"]
+    )
     clean["storage_no"] = clean["storage_no"].astype(int)
     clean = clean[
         clean["storage_no"].isin(STORAGE_NUMBERS)
         & clean["temperature"].between(-10, 80)
         & clean["humidity"].between(0, 100)
         & clean["mq135_raw"].between(0, 4095)
-        & clean["risk_label"].isin(VALID_LABELS)
+        & clean["risk_label"].isin(RISK_ORDER)
     ]
-    clean = clean.sort_values(["storage_no", "created_at", "id"]).drop_duplicates("id", keep="last")
+    clean = (
+        clean.sort_values(["storage_no", "created_at", "id"])
+        .drop_duplicates("id", keep="last")
+    )
 
-    # Recent change features help the forest learn whether conditions are rising or falling.
     for column in SENSOR_COLUMNS:
-        clean[f"{column.replace('_raw', '')}_delta"] = clean.groupby("storage_no")[column].diff().fillna(0.0)
+        delta_name = f"{column.replace('_raw', '')}_delta"
+        clean[delta_name] = clean.groupby("storage_no")[column].diff().fillna(0.0)
 
     return clean.reset_index(drop=True)
 
 
 def build_forecast_pairs(clean):
-    paired_parts = []
+    parts = []
     horizon = pd.Timedelta(minutes=FORECAST_MINUTES)
     tolerance = pd.Timedelta(minutes=FORECAST_TOLERANCE_MINUTES)
 
-    for storage_no, current in clean.groupby("storage_no", sort=True):
+    for _, current in clean.groupby("storage_no", sort=True):
         current = current.sort_values("created_at").copy()
         current["target_time"] = current["created_at"] + horizon
 
-        future = current[["created_at", *SENSOR_COLUMNS, "risk_label"]].rename(columns={
+        future = current[
+            ["created_at", *SENSOR_COLUMNS, "risk_label"]
+        ].rename(columns={
             "created_at": "future_created_at",
             "temperature": "future_temperature",
             "humidity": "future_humidity",
             "mq135_raw": "future_mq135_raw",
             "risk_label": "future_risk_label",
-        }).sort_values("future_created_at")
+        })
 
         paired = pd.merge_asof(
             current.sort_values("target_time"),
-            future,
+            future.sort_values("future_created_at"),
             left_on="target_time",
             right_on="future_created_at",
             direction="nearest",
             tolerance=tolerance,
         )
-        paired = paired.dropna(subset=["future_created_at", "future_temperature", "future_humidity", "future_mq135_raw", "future_risk_label"])
-        paired["forecast_gap_minutes"] = (paired["future_created_at"] - paired["created_at"]).dt.total_seconds() / 60.0
-        paired_parts.append(paired)
+        paired = paired.dropna(subset=[
+            "future_created_at",
+            "future_temperature",
+            "future_humidity",
+            "future_mq135_raw",
+            "future_risk_label",
+        ])
+        # This explicit check prevents an unexpectedly old row becoming a target.
+        gap = paired["future_created_at"] - paired["created_at"]
+        paired = paired[
+            gap.between(
+                horizon - tolerance,
+                horizon + tolerance,
+                inclusive="both",
+            )
+        ]
+        parts.append(paired)
 
-    if not paired_parts:
+    if not parts:
         return pd.DataFrame()
-    pairs = pd.concat(paired_parts, ignore_index=True).sort_values("created_at").reset_index(drop=True)
-    print(f"✅ Built {len(pairs):,} T+{FORECAST_MINUTES}-minute training pairs.")
-    print(pairs.groupby("storage_no").size())
-    print("Future risk labels:")
-    print(pairs["future_risk_label"].value_counts())
-    return pairs
+    pairs = pd.concat(parts, ignore_index=True).sort_values("created_at")
+    print(f"Built {len(pairs):,} valid T+{FORECAST_MINUTES} training pairs.")
+    return pairs.reset_index(drop=True)
 
-# ============================================================
-# CELL 5: TRAIN AND TIME-ORDER EVALUATE RANDOM FORESTS
-# ============================================================
+
+# ------------------------------- Models ----------------------------------
 
 def make_preprocessor():
     return ColumnTransformer(
@@ -200,8 +257,11 @@ def make_regressor():
     return Pipeline([
         ("prepare", make_preprocessor()),
         ("model", RandomForestRegressor(
-            n_estimators=350, max_depth=14, min_samples_leaf=2,
-            random_state=RANDOM_STATE, n_jobs=-1,
+            n_estimators=300,
+            max_depth=14,
+            min_samples_leaf=2,
+            random_state=RANDOM_STATE,
+            n_jobs=-1,
         )),
     ])
 
@@ -210,68 +270,82 @@ def make_classifier():
     return Pipeline([
         ("prepare", make_preprocessor()),
         ("model", RandomForestClassifier(
-            n_estimators=350, max_depth=14, min_samples_leaf=2,
-            class_weight="balanced_subsample", random_state=RANDOM_STATE, n_jobs=-1,
+            n_estimators=300,
+            max_depth=14,
+            min_samples_leaf=2,
+            class_weight="balanced_subsample",
+            random_state=RANDOM_STATE,
+            n_jobs=-1,
         )),
     ])
 
 
 def train_models(pairs):
     if len(pairs) < MIN_TRAINING_PAIRS:
-        raise ValueError(f"Need at least {MIN_TRAINING_PAIRS} valid forecast pairs; found {len(pairs)}.")
-    if pairs["future_risk_label"].nunique() < 2:
-        raise ValueError("At least two future risk classes are required.")
+        raise ValueError(
+            f"Need at least {MIN_TRAINING_PAIRS} valid 10-minute pairs; "
+            f"found {len(pairs)}."
+        )
 
     ordered = pairs.sort_values("created_at").reset_index(drop=True)
-    split_at = max(1, int(len(ordered) * 0.80))
-    train = ordered.iloc[:split_at]
-    test = ordered.iloc[split_at:]
-    if test.empty:
-        raise ValueError("Not enough rows for a time-ordered test set.")
-
-    X_train, X_test = train[FEATURE_COLUMNS], test[FEATURE_COLUMNS]
-    target_columns = ["future_temperature", "future_humidity", "future_mq135_raw"]
+    split_at = min(len(ordered) - 1, max(1, int(len(ordered) * 0.80)))
+    train, test = ordered.iloc[:split_at], ordered.iloc[split_at:]
+    targets = ["future_temperature", "future_humidity", "future_mq135_raw"]
 
     evaluation_regressor = make_regressor()
-    evaluation_regressor.fit(X_train, train[target_columns])
-    reg_pred = evaluation_regressor.predict(X_test)
-    mae_values = mean_absolute_error(test[target_columns], reg_pred, multioutput="raw_values")
+    evaluation_regressor.fit(train[FEATURE_COLUMNS], train[targets])
+    reg_prediction = evaluation_regressor.predict(test[FEATURE_COLUMNS])
+    mae = mean_absolute_error(test[targets], reg_prediction, multioutput="raw_values")
 
-    evaluation_classifier = make_classifier()
-    evaluation_classifier.fit(X_train, train["future_risk_label"])
-    class_pred = evaluation_classifier.predict(X_test)
     metrics = {
-        "accuracy": float(accuracy_score(test["future_risk_label"], class_pred)),
-        "macro_f1": float(f1_score(test["future_risk_label"], class_pred, average="macro", zero_division=0)),
-        "temperature_mae": float(mae_values[0]),
-        "humidity_mae": float(mae_values[1]),
-        "mq135_mae": float(mae_values[2]),
+        "temperature_mae": float(mae[0]),
+        "humidity_mae": float(mae[1]),
+        "mq135_mae": float(mae[2]),
+        "accuracy": None,
+        "macro_f1": None,
         "test_rows": int(len(test)),
     }
-    print("✅ Time-ordered evaluation:", metrics)
-    print(classification_report(test["future_risk_label"], class_pred, zero_division=0))
 
-    # Evaluation is finished; train production models on every approved pair.
+    classifier = None
+    if ordered["future_risk_label"].nunique() >= 2:
+        # Evaluate only when the chronological training portion has two classes.
+        if train["future_risk_label"].nunique() >= 2:
+            evaluation_classifier = make_classifier()
+            evaluation_classifier.fit(
+                train[FEATURE_COLUMNS], train["future_risk_label"]
+            )
+            class_prediction = evaluation_classifier.predict(test[FEATURE_COLUMNS])
+            metrics["accuracy"] = float(
+                accuracy_score(test["future_risk_label"], class_prediction)
+            )
+            metrics["macro_f1"] = float(
+                f1_score(
+                    test["future_risk_label"],
+                    class_prediction,
+                    average="macro",
+                    zero_division=0,
+                )
+            )
+
+        classifier = make_classifier()
+        classifier.fit(
+            ordered[FEATURE_COLUMNS], ordered["future_risk_label"]
+        )
+    else:
+        print(
+            "Only one risk class is available. Sensor forecasts will still run; "
+            "risk will be calculated from the predicted values and thresholds."
+        )
+
     regressor = make_regressor()
-    classifier = make_classifier()
-    regressor.fit(ordered[FEATURE_COLUMNS], ordered[target_columns])
-    classifier.fit(ordered[FEATURE_COLUMNS], ordered["future_risk_label"])
+    regressor.fit(ordered[FEATURE_COLUMNS], ordered[targets])
+    print("Evaluation:", metrics)
     return regressor, classifier, metrics
 
-# ============================================================
-# CELL 6: CREATE DATA-BASED, STORAGE-SPECIFIC SAFE THRESHOLDS
-# ============================================================
-# Thresholds use the lower quartile of CURRENT readings that were
-# followed by warning/critical conditions about 10 minutes later.
-# Safety bounds prevent the system from learning very unsafe values as normal.
 
-DEFAULT_RULES = {
-    "temperature_on": 30.0, "temperature_off": 28.0,
-    "humidity_on": 70.0, "humidity_off": 65.0,
-    "mq135_on": 1500.0, "mq135_off": 1300.0,
-}
+# -------------------------- Rules and predictions -------------------------
 
-def _bounded(value, low, high):
+def bounded(value, low, high):
     return float(np.clip(float(value), low, high))
 
 
@@ -279,73 +353,78 @@ def generate_model_rules(pairs):
     rules_by_storage = {}
     for storage_no in STORAGE_NUMBERS:
         storage = pairs[pairs["storage_no"] == storage_no]
-        risky = storage[storage["future_risk_label"].isin(["warning", "critical"])]
+        risky = storage[
+            storage["future_risk_label"].isin(["warning", "critical"])
+        ]
 
         if len(risky) < 5:
             rules = dict(DEFAULT_RULES)
-            source = f"defaults (only {len(risky)} future-risk rows)"
+            source = "default"
         else:
-            temperature_on = _bounded(risky["temperature"].quantile(0.25), 25.0, 30.0)
-            humidity_on = _bounded(risky["humidity"].quantile(0.25), 60.0, 70.0)
-            mq135_on = _bounded(risky["mq135_raw"].quantile(0.25), 100.0, 4000.0)
+            temperature_on = bounded(
+                risky["temperature"].quantile(0.25), 25.0, 30.0
+            )
+            humidity_on = bounded(
+                risky["humidity"].quantile(0.25), 60.0, 70.0
+            )
+            mq135_on = bounded(
+                risky["mq135_raw"].quantile(0.25), 100.0, 4000.0
+            )
             rules = {
                 "temperature_on": temperature_on,
-                "temperature_off": max(-10.0, temperature_on - 2.0),
+                "temperature_off": temperature_on - 2.0,
                 "humidity_on": humidity_on,
-                "humidity_off": max(0.0, humidity_on - 5.0),
+                "humidity_off": humidity_on - 5.0,
                 "mq135_on": mq135_on,
-                "mq135_off": max(0.0, mq135_on - max(50.0, mq135_on * 0.10)),
+                "mq135_off": mq135_on - max(50.0, mq135_on * 0.10),
             }
-            source = f"{len(risky)} future-risk rows"
+            source = "random_forest"
 
-        rules_by_storage[storage_no] = {k: round(float(v), 2) for k, v in rules.items()}
-        print(f"Storage {storage_no}: {rules_by_storage[storage_no]} [{source}]")
+        rules["source"] = source
+        rules_by_storage[storage_no] = rules
     return rules_by_storage
 
-# ============================================================
-# CELL 7: SAFELY PUBLISH NEW MODEL RULES TO SUPABASE
-# ============================================================
-# Inserts the new active rule first. Only after a successful insert does it
-# deactivate older versions, preventing a failed insert from leaving no rule.
 
-def save_model_rules_to_supabase(rules_by_storage, metrics):
-    model_version = "RF10M_" + datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    all_saved = True
-
-    for storage_no, rules in rules_by_storage.items():
+def publish_model_rules(rules_by_storage, metrics, model_version):
+    for storage_no, rule_with_source in rules_by_storage.items():
+        rules = {
+            key: round(float(value), 2)
+            for key, value in rule_with_source.items()
+            if key != "source"
+        }
         payload = {
             "device_id": DEVICE_ID,
-            "storage_no": int(storage_no),
+            "storage_no": storage_no,
             "model_version": model_version,
             **rules,
-            "accuracy": metrics.get("accuracy"),
+            "accuracy": metrics["accuracy"],
             "prediction_type": "10_minute_sensor_and_risk_forecast",
             "is_active": True,
-            "notes": f"Time-ordered RF; macro_f1={metrics.get('macro_f1', 0):.4f}",
+            "notes": (
+                f"source={rule_with_source['source']}; "
+                f"macro_f1={metrics['macro_f1']}"
+            ),
         }
-        try:
-            supabase_request("POST", MODEL_RULES_TABLE, payload=payload, prefer="return=representation")
-            supabase_request(
-                "PATCH",
-                MODEL_RULES_TABLE,
-                params={
-                    "device_id": f"eq.{DEVICE_ID}",
-                    "storage_no": f"eq.{storage_no}",
-                    "is_active": "eq.true",
-                    "model_version": f"neq.{model_version}",
-                },
-                payload={"is_active": False},
-            )
-            print(f"✅ Storage {storage_no}: published {model_version}.")
-        except Exception as error:
-            all_saved = False
-            print(f"❌ Storage {storage_no}: rule publication failed: {error}")
+        # Insert first, so a failed insert never leaves the ESP32 without a rule.
+        supabase_request(
+            "POST",
+            MODEL_RULES_TABLE,
+            payload=payload,
+            prefer="return=representation",
+        )
+        supabase_request(
+            "PATCH",
+            MODEL_RULES_TABLE,
+            params={
+                "device_id": f"eq.{DEVICE_ID}",
+                "storage_no": f"eq.{storage_no}",
+                "is_active": "eq.true",
+                "model_version": f"neq.{model_version}",
+            },
+            payload={"is_active": False},
+        )
+        print(f"Storage {storage_no}: model rule published.")
 
-    return all_saved, model_version
-
-# ============================================================
-# CELL 8: GET AND VALIDATE THE LATEST READING FOR EACH STORAGE
-# ============================================================
 
 def fetch_latest_sensor_reading(storage_no):
     rows = supabase_request(
@@ -354,38 +433,54 @@ def fetch_latest_sensor_reading(storage_no):
         params={
             "device_id": f"eq.{DEVICE_ID}",
             "storage_no": f"eq.{storage_no}",
-            "select": "id,device_id,storage_no,temperature,humidity,mq135_raw,risk_label,created_at",
+            "select": (
+                "id,device_id,storage_no,temperature,humidity,"
+                "mq135_raw,risk_label,created_at"
+            ),
             "order": "created_at.desc,id.desc",
             "limit": 2,
         },
     )
     if not rows:
-        print(f"⚠️ Storage {storage_no}: no reading found.")
         return None
 
     latest = rows[0]
-    latest_time = pd.to_datetime(latest["created_at"], utc=True, errors="coerce")
-    age_minutes = (pd.Timestamp.now(tz="UTC") - latest_time).total_seconds() / 60.0
-    if pd.isna(latest_time) or age_minutes > MAX_LATEST_AGE_MINUTES:
-        print(f"⚠️ Storage {storage_no}: newest reading is stale ({age_minutes:.1f} minutes old); skipped.")
+    latest_time = pd.to_datetime(
+        latest.get("created_at"), utc=True, errors="coerce"
+    )
+    if pd.isna(latest_time):
+        return None
+    age = (pd.Timestamp.now(tz="UTC") - latest_time).total_seconds() / 60
+    if age > MAX_LATEST_AGE_MINUTES:
+        print(f"Storage {storage_no}: latest reading is {age:.1f} minutes old.")
         return None
 
     previous = rows[1] if len(rows) > 1 else latest
     try:
-        latest["temperature_delta"] = float(latest["temperature"]) - float(previous["temperature"])
-        latest["humidity_delta"] = float(latest["humidity"]) - float(previous["humidity"])
-        latest["mq135_delta"] = float(latest["mq135_raw"]) - float(previous["mq135_raw"])
-    except (TypeError, ValueError, KeyError) as error:
-        print(f"⚠️ Storage {storage_no}: invalid latest values ({error}); skipped.")
+        for sensor in SENSOR_COLUMNS:
+            delta_name = f"{sensor.replace('_raw', '')}_delta"
+            latest[delta_name] = float(latest[sensor]) - float(previous[sensor])
+    except (KeyError, TypeError, ValueError):
         return None
     return latest
 
-# ============================================================
-# CELL 9: MAKE A T+10-MINUTE FORECAST AND IDENTIFY RISKS
-# ============================================================
+
+def risk_from_values(temperature, humidity, mq135, rules):
+    risks = []
+    if temperature >= rules["temperature_on"]:
+        risks.append("high_temperature")
+    if humidity >= rules["humidity_on"]:
+        risks.append("high_humidity")
+    if mq135 >= rules["mq135_on"]:
+        risks.append("poor_air_quality")
+
+    count = len(risks)
+    status = "critical" if count >= 2 else "warning" if count == 1 else "safe"
+    return status, risks or ["none"]
+
 
 def forecast_latest(latest, regressor, classifier, rules):
-    X = pd.DataFrame([{
+    features = pd.DataFrame([{
         "storage_no": int(latest["storage_no"]),
         "temperature": float(latest["temperature"]),
         "humidity": float(latest["humidity"]),
@@ -395,47 +490,48 @@ def forecast_latest(latest, regressor, classifier, rules):
         "mq135_delta": float(latest["mq135_delta"]),
     }])[FEATURE_COLUMNS]
 
-    predicted_values = regressor.predict(X)[0]
-    predicted_temperature = _bounded(predicted_values[0], -10, 80)
-    predicted_humidity = _bounded(predicted_values[1], 0, 100)
-    predicted_mq135 = _bounded(predicted_values[2], 0, 4095)
-    predicted_status = str(classifier.predict(X)[0])
-    probabilities = classifier.predict_proba(X)[0]
-    confidence = float(np.max(probabilities))
-    prediction_for = pd.to_datetime(latest["created_at"], utc=True) + pd.Timedelta(minutes=FORECAST_MINUTES)
+    values = regressor.predict(features)[0]
+    temperature = bounded(values[0], -10, 80)
+    humidity = bounded(values[1], 0, 100)
+    mq135 = bounded(values[2], 0, 4095)
+    threshold_status, sources = risk_from_values(
+        temperature, humidity, mq135, rules
+    )
 
-    temperature_risk = predicted_temperature >= rules["temperature_on"]
-    humidity_risk = predicted_humidity >= rules["humidity_on"]
-    air_quality_risk = predicted_mq135 >= rules["mq135_on"]
-    sources = []
-    if temperature_risk: sources.append("high_temperature")
-    if humidity_risk: sources.append("high_humidity")
-    if air_quality_risk: sources.append("poor_air_quality")
+    status = threshold_status
+    confidence = None
+    if classifier is not None:
+        model_status = str(classifier.predict(features)[0]).lower()
+        probability = classifier.predict_proba(features)[0]
+        confidence = float(np.max(probability))
+        if RISK_ORDER.get(model_status, 0) > RISK_ORDER[status]:
+            status = model_status
+            sources = [*sources, "risk_classifier"]
 
+    prediction_for = (
+        pd.to_datetime(latest["created_at"], utc=True)
+        + pd.Timedelta(minutes=FORECAST_MINUTES)
+    )
     return {
         "prediction_for": prediction_for.isoformat(),
-        "predicted_temperature": round(predicted_temperature, 2),
-        "predicted_humidity": round(predicted_humidity, 2),
-        "predicted_mq135_raw": round(predicted_mq135, 2),
-        "prediction_status": predicted_status,
-        "prediction_score": round(confidence, 6),
-        "temperature_risk": bool(temperature_risk),
-        "humidity_risk": bool(humidity_risk),
-        "air_quality_risk": bool(air_quality_risk),
-        "risk_sources": sources or ["none"],
+        "predicted_temperature": round(temperature, 2),
+        "predicted_humidity": round(humidity, 2),
+        "predicted_mq135_raw": round(mq135, 2),
+        "prediction_status": status,
+        "prediction_score": (
+            round(confidence, 6) if confidence is not None else None
+        ),
+        "temperature_risk": temperature >= rules["temperature_on"],
+        "humidity_risk": humidity >= rules["humidity_on"],
+        "air_quality_risk": mq135 >= rules["mq135_on"],
+        "risk_sources": list(dict.fromkeys(sources)),
     }
 
-# ============================================================
-# CELL 10: UPSERT/UPDATE A PREDICTION WITHOUT DUPLICATES
-# ============================================================
-# Required predictions columns include the old current-value columns plus:
-# predicted_temperature, predicted_humidity, predicted_mq135_raw,
-# prediction_for, and created_at (created_at may have a DB default).
 
-def save_prediction_to_supabase(latest, forecast, model_version):
+def save_prediction(latest, forecast, model_version):
     payload = {
         "device_id": DEVICE_ID,
-        "sensor_data_id": latest["id"],
+        "sensor_data_id": int(latest["id"]),
         "storage_no": int(latest["storage_no"]),
         "temperature": float(latest["temperature"]),
         "humidity": float(latest["humidity"]),
@@ -443,70 +539,75 @@ def save_prediction_to_supabase(latest, forecast, model_version):
         **forecast,
         "model_version": model_version,
     }
-
     existing = supabase_request(
         "GET",
         PREDICTIONS_TABLE,
         params={
-            "sensor_data_id": f"eq.{latest['id']}",
+            "sensor_data_id": f"eq.{int(latest['id'])}",
             "storage_no": f"eq.{int(latest['storage_no'])}",
             "select": "id",
             "limit": 1,
         },
     )
     if existing:
-        supabase_request("PATCH", PREDICTIONS_TABLE, params={"id": f"eq.{existing[0]['id']}"}, payload=payload)
-        action = "updated"
+        supabase_request(
+            "PATCH",
+            PREDICTIONS_TABLE,
+            params={"id": f"eq.{existing[0]['id']}"},
+            payload=payload,
+        )
     else:
-        supabase_request("POST", PREDICTIONS_TABLE, payload=payload, prefer="return=representation")
-        action = "inserted"
-    print(f"✅ Storage {latest['storage_no']}: prediction {action}.")
+        supabase_request(
+            "POST",
+            PREDICTIONS_TABLE,
+            payload=payload,
+            prefer="return=representation",
+        )
+    print(f"Storage {latest['storage_no']}: prediction saved.")
 
-# ============================================================
-# CELL 11: COMPLETE ONE-RUN PIPELINE
-# ============================================================
 
-def run_silo_random_forest_pipeline(publish=True):
-    print("=" * 60)
-    print(f"S.I.L.O. ANALYTICS — {FORECAST_MINUTES}-MINUTE FORECAST")
-    print("=" * 60)
+# ------------------------------ Main run ---------------------------------
+
+def run_pipeline():
+    started = datetime.now(timezone.utc)
+    model_version = "RF10M_" + started.strftime("%Y%m%d_%H%M%S")
+    print(f"S.I.L.O. Random Forest run: {model_version}")
 
     raw = fetch_sensor_data()
     if raw.empty:
-        raise RuntimeError("Pipeline stopped: Supabase returned no sensor data.")
+        raise RuntimeError("No matching sensor data was returned by Supabase.")
 
     clean = clean_sensor_data(raw)
     pairs = build_forecast_pairs(clean)
     regressor, classifier, metrics = train_models(pairs)
     rules_by_storage = generate_model_rules(pairs)
 
-    model_version = "DRY_RUN_" + datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    if publish:
-        rules_saved, model_version = save_model_rules_to_supabase(rules_by_storage, metrics)
-        if not rules_saved:
-            print("⚠️ One or more rules failed to publish; predictions will still be attempted.")
+    publish_model_rules(rules_by_storage, metrics, model_version)
 
-    saved_predictions = 0
+    saved = 0
     for storage_no in STORAGE_NUMBERS:
         latest = fetch_latest_sensor_reading(storage_no)
         if latest is None:
+            print(f"Storage {storage_no}: no fresh valid reading; skipped.")
             continue
-        forecast = forecast_latest(latest, regressor, classifier, rules_by_storage[storage_no])
-        print(f"Storage {storage_no} forecast:", forecast)
-        if publish:
-            save_prediction_to_supabase(latest, forecast, model_version)
-            saved_predictions += 1
+        forecast = forecast_latest(
+            latest,
+            regressor,
+            classifier,
+            rules_by_storage[storage_no],
+        )
+        save_prediction(latest, forecast, model_version)
+        saved += 1
 
-    result = {
-        "model_version": model_version,
-        "training_pairs": len(pairs),
-        "metrics": metrics,
-        "rules": rules_by_storage,
-        "predictions_saved": saved_predictions,
-        "published": bool(publish),
-    }
-    print("✅ Pipeline completed.")
-    return result
+    print(
+        f"Completed: {len(pairs)} pairs, {saved} predictions, "
+        f"elapsed={(datetime.now(timezone.utc) - started).total_seconds():.1f}s"
+    )
+
 
 if __name__ == "__main__":
-    run_silo_random_forest_pipeline(publish=True)
+    try:
+        run_pipeline()
+    except Exception as error:
+        print(f"ERROR: {error}", file=sys.stderr)
+        raise
