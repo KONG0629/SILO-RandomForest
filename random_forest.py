@@ -32,7 +32,7 @@ if not SUPABASE_URL or not SUPABASE_KEY:
     )
 
 DEVICE_ID = os.getenv("SILO_DEVICE_ID", "ESP32_SILO_001")
-SENSOR_TABLE = "sensordata"
+SENSOR_TABLE = "sensor_readings"
 PREDICTIONS_TABLE = "predictions"
 MODEL_RULES_TABLE = "model_rules"
 STORAGE_NUMBERS = (1, 2, 3)
