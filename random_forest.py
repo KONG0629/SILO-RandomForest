@@ -8,6 +8,7 @@ import os
 import sys
 import warnings
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 import numpy as np
 import pandas as pd
@@ -31,7 +32,7 @@ if not SUPABASE_URL or not SUPABASE_KEY:
         "Add both values to GitHub repository Actions secrets."
     )
 
-DEVICE_ID = os.getenv("SILO_DEVICE_ID", "ESP32-S3-SILO-001")
+DEVICE_ID = os.getenv("SILO_DEVICE_ID", "ESP32-S3-SILO-001").strip()
 SENSOR_TABLE = "sensor_readings"
 PREDICTIONS_TABLE = "predictions"
 MODEL_RULES_TABLE = "model_rules"
@@ -115,13 +116,18 @@ def supabase_request(method, table, *, params=None, payload=None, prefer=None):
 
 
 def fetch_sensor_data():
-    """Fetch the newest MAX_SOURCE_ROWS, then restore chronological order."""
+    """Fetch sensor history for the configured device from Supabase."""
     selected = (
         "id,device_id,storage_no,temperature,humidity,"
         "mq135_raw,risk_label,created_at"
     )
-    rows = []
 
+    project_host = urlparse(SUPABASE_URL).netloc or SUPABASE_URL
+    print(f"Supabase project: {project_host}")
+    print(f"Sensor table: {SENSOR_TABLE}")
+    print(f"Device ID query: {DEVICE_ID!r}")
+
+    rows = []
     for offset in range(0, MAX_SOURCE_ROWS, PAGE_SIZE):
         page = supabase_request(
             "GET",
@@ -130,20 +136,65 @@ def fetch_sensor_data():
                 "device_id": f"eq.{DEVICE_ID}",
                 "select": selected,
                 "order": "created_at.desc,id.desc",
-                "limit": PAGE_SIZE,
-                "offset": offset,
+                "limit": str(PAGE_SIZE),
+                "offset": str(offset),
             },
         )
+
+        if not isinstance(page, list):
+            raise TypeError(
+                f"Expected a list from Supabase, received {type(page).__name__}."
+            )
+
+        print(f"Sensor page offset={offset}: {len(page)} row(s)")
         rows.extend(page)
+
         if len(page) < PAGE_SIZE:
             break
 
-    frame = pd.DataFrame(rows)
-    if frame.empty:
+    if rows:
+        frame = pd.DataFrame(rows)
+        print(f"Downloaded {len(frame):,} sensor row(s) for {DEVICE_ID}.")
         return frame
 
-    print(f"Downloaded {len(frame):,} newest sensor rows.")
-    return frame
+    # Diagnostic query: this does not train on another device. It only reveals
+    # whether GitHub is connected to the expected Supabase project/table.
+    sample = supabase_request(
+        "GET",
+        SENSOR_TABLE,
+        params={
+            "select": "device_id,created_at",
+            "order": "created_at.desc",
+            "limit": "20",
+        },
+    )
+
+    available_ids = sorted({
+        str(row.get("device_id", "")).strip()
+        for row in sample
+        if isinstance(row, dict) and row.get("device_id")
+    })
+
+    print(f"No rows matched device ID {DEVICE_ID!r}.")
+    print(f"Device IDs visible in this Supabase project: {available_ids or 'none'}")
+
+    if DEVICE_ID in available_ids:
+        print(
+            "The correct ID exists in Supabase, but the filtered request returned "
+            "nothing. Check the table permissions and service-role secret."
+        )
+    elif available_ids:
+        print(
+            "GitHub is reaching Supabase, but this project contains different "
+            "device IDs. Check SILO_DEVICE_ID and the SUPABASE_URL secret."
+        )
+    else:
+        print(
+            "No sensor rows are visible. The GitHub secrets may point to another "
+            "Supabase project, or the sensor_readings table is empty there."
+        )
+
+    return pd.DataFrame()
 
 
 # -------------------------- Cleaning and pairing --------------------------
@@ -169,8 +220,12 @@ def clean_sensor_data(frame):
         .replace({"normal": "safe"})
     )
 
+    before_drop = len(clean)
     clean = clean.dropna(
         subset=["id", "storage_no", *SENSOR_COLUMNS, "risk_label", "created_at"]
+    )
+    print(
+        f"Rows with all required sensor values: {len(clean):,}/{before_drop:,}"
     )
     clean["storage_no"] = clean["storage_no"].astype(int)
     clean = clean[
@@ -189,7 +244,9 @@ def clean_sensor_data(frame):
         delta_name = f"{column.replace('_raw', '')}_delta"
         clean[delta_name] = clean.groupby("storage_no")[column].diff().fillna(0.0)
 
-    return clean.reset_index(drop=True)
+    clean = clean.reset_index(drop=True)
+    print(f"Usable cleaned sensor rows: {len(clean):,}")
+    return clean
 
 
 def build_forecast_pairs(clean):
@@ -575,10 +632,26 @@ def run_pipeline():
 
     raw = fetch_sensor_data()
     if raw.empty:
-        raise RuntimeError("No matching sensor data was returned by Supabase.")
+        raise RuntimeError(
+            "No matching sensor data was returned by Supabase. "
+            "Read the diagnostic lines above to check the project, table, "
+            "device ID, and GitHub secrets."
+        )
 
     clean = clean_sensor_data(raw)
+    if clean.empty:
+        raise RuntimeError(
+            "Rows were downloaded, but none remained after validation. "
+            "Check for NULL/invalid temperature, humidity, mq135_raw, "
+            "risk_label, storage_no, or created_at values."
+        )
+
     pairs = build_forecast_pairs(clean)
+    if pairs.empty:
+        raise RuntimeError(
+            "Sensor rows were found, but no valid 10-minute training pairs "
+            "could be built. Make sure readings cover more than 10 minutes."
+        )
     regressor, classifier, metrics = train_models(pairs)
     rules_by_storage = generate_model_rules(pairs)
 
