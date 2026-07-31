@@ -455,7 +455,7 @@ def publish_model_rules(rules_by_storage, metrics, model_version):
             "model_version": model_version,
             **rules,
             "accuracy": metrics["accuracy"],
-            "prediction_type": "10_minute_sensor_and_risk_forecast",
+            "prediction_type": "risk_classification",
             "is_active": True,
             "notes": (
                 f"source={rule_with_source['source']}; "
