@@ -36,5 +36,5 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          SILO_DEVICE_ID: ESP32_SILO_001
+          SILO_DEVICE_ID: ESP32-S3-SILO-001
         run: python -u random_forest.py
