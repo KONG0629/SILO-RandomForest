@@ -548,19 +548,26 @@ def forecast_latest(latest, regressor, classifier, rules):
     }])[FEATURE_COLUMNS]
 
     values = regressor.predict(features)[0]
+
     temperature = bounded(values[0], -10, 80)
     humidity = bounded(values[1], 0, 100)
     mq135 = bounded(values[2], 0, 4095)
+
     threshold_status, sources = risk_from_values(
-        temperature, humidity, mq135, rules
+        temperature,
+        humidity,
+        mq135,
+        rules
     )
 
     status = threshold_status
     confidence = None
+
     if classifier is not None:
         model_status = str(classifier.predict(features)[0]).lower()
         probability = classifier.predict_proba(features)[0]
         confidence = float(np.max(probability))
+
         if RISK_ORDER.get(model_status, 0) > RISK_ORDER[status]:
             status = model_status
             sources = [*sources, "risk_classifier"]
@@ -569,19 +576,43 @@ def forecast_latest(latest, regressor, classifier, rules):
         pd.to_datetime(latest["created_at"], utc=True)
         + pd.Timedelta(minutes=FORECAST_MINUTES)
     )
+
+    # Convert individual risk conditions to text
+    temperature_risk = (
+        "high_temperature"
+        if temperature >= rules["temperature_on"]
+        else "normal"
+    )
+
+    humidity_risk = (
+        "high_humidity"
+        if humidity >= rules["humidity_on"]
+        else "normal"
+    )
+
+    mq135_risk = (
+        "poor_air_quality"
+        if mq135 >= rules["mq135_on"]
+        else "normal"
+    )
+
     return {
         "prediction_for": prediction_for.isoformat(),
+
         "predicted_temperature": round(temperature, 2),
         "predicted_humidity": round(humidity, 2),
         "predicted_mq135_raw": round(mq135, 2),
+
         "prediction_status": status,
         "prediction_score": (
-            round(confidence, 6) if confidence is not None else None
+            round(confidence, 6)
+            if confidence is not None
+            else None
         ),
-        "temperature_risk": temperature >= rules["temperature_on"],
-        "humidity_risk": humidity >= rules["humidity_on"],
-        "mq135_risk": mq135 >= rules["mq135_on"],
-        "risk_sources": list(dict.fromkeys(sources)),
+
+        "temperature_risk": temperature_risk,
+        "humidity_risk": humidity_risk,
+        "mq135_risk": mq135_risk,
     }
 
 
