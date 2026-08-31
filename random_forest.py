@@ -580,7 +580,7 @@ def forecast_latest(latest, regressor, classifier, rules):
         ),
         "temperature_risk": temperature >= rules["temperature_on"],
         "humidity_risk": humidity >= rules["humidity_on"],
-        "air_quality_risk": mq135 >= rules["mq135_on"],
+        "mq135_risk": mq135 >= rules["mq135_on"],
         "risk_sources": list(dict.fromkeys(sources)),
     }
 
