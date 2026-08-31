@@ -588,7 +588,7 @@ def forecast_latest(latest, regressor, classifier, rules):
 def save_prediction(latest, forecast, model_version):
     payload = {
         "device_id": DEVICE_ID,
-        "sensor_data_id": int(latest["id"]),
+        "sensor_reading_id": int(latest["id"]),
         "storage_no": int(latest["storage_no"]),
         "temperature": float(latest["temperature"]),
         "humidity": float(latest["humidity"]),
@@ -600,7 +600,7 @@ def save_prediction(latest, forecast, model_version):
         "GET",
         PREDICTIONS_TABLE,
         params={
-            "sensor_data_id": f"eq.{int(latest['id'])}",
+            "sensor_reading_id": f"eq.{int(latest['id'])}",
             "storage_no": f"eq.{int(latest['storage_no'])}",
             "select": "id",
             "limit": 1,
