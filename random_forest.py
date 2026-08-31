@@ -615,28 +615,65 @@ def forecast_latest(latest, regressor, classifier, rules):
         "mq135_risk": mq135_risk,
     }
 
+def fetch_storage_column_id(storage_no):
+    rows = supabase_request(
+        "GET",
+        "storage_columns",
+        params={
+            "device_id": f"eq.{DEVICE_ID}",
+            "column_number": f"eq.{int(storage_no)}",
+            "select": "id,column_number,column_name",
+            "limit": 1,
+        },
+    )
+
+    if not rows:
+        raise RuntimeError(
+            f"No storage_columns row found for device "
+            f"{DEVICE_ID!r}, column_number={storage_no}."
+        )
+
+    storage_column_id = rows[0].get("id")
+
+    if storage_column_id is None:
+        raise RuntimeError(
+            f"storage_columns row for column {storage_no} has no id."
+        )
+
+    return int(storage_column_id)
 
 def save_prediction(latest, forecast, model_version):
+    storage_no = int(latest["storage_no"])
+
+    # Get the real primary-key ID from storage_columns.
+    storage_column_id = fetch_storage_column_id(storage_no)
+
     payload = {
         "device_id": DEVICE_ID,
+        "storage_column_id": storage_column_id,
         "sensor_reading_id": int(latest["id"]),
-        "storage_no": int(latest["storage_no"]),
+        "storage_no": storage_no,
+
         "temperature": float(latest["temperature"]),
         "humidity": float(latest["humidity"]),
         "mq135_raw": float(latest["mq135_raw"]),
+
         **forecast,
+
         "model_version": model_version,
     }
+
     existing = supabase_request(
         "GET",
         PREDICTIONS_TABLE,
         params={
             "sensor_reading_id": f"eq.{int(latest['id'])}",
-            "storage_no": f"eq.{int(latest['storage_no'])}",
+            "storage_no": f"eq.{storage_no}",
             "select": "id",
             "limit": 1,
         },
     )
+
     if existing:
         supabase_request(
             "PATCH",
@@ -651,7 +688,11 @@ def save_prediction(latest, forecast, model_version):
             payload=payload,
             prefer="return=representation",
         )
-    print(f"Storage {latest['storage_no']}: prediction saved.")
+
+    print(
+        f"Storage {storage_no}: prediction saved "
+        f"(storage_column_id={storage_column_id})."
+    )
 
 
 # ------------------------------ Main run ---------------------------------
