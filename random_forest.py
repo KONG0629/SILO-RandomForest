@@ -587,6 +587,7 @@ def forecast_latest(latest, regressor, classifier, rules):
     humidity = bounded(values[1], 0, 100)
     mq135 = bounded(values[2], 0, 4095)
 
+    # Determine overall risk from the predicted values
     threshold_status, sources = risk_from_values(
         temperature,
         humidity,
@@ -597,6 +598,7 @@ def forecast_latest(latest, regressor, classifier, rules):
     status = threshold_status
     confidence = None
 
+    # Optional Random Forest risk classification
     if classifier is not None:
         model_status = str(classifier.predict(features)[0]).lower()
         probability = classifier.predict_proba(features)[0]
@@ -611,7 +613,7 @@ def forecast_latest(latest, regressor, classifier, rules):
         + pd.Timedelta(minutes=FORECAST_MINUTES)
     )
 
-    # Convert individual risk conditions to text
+    # Individual risk indicators
     temperature_risk = (
         "high_temperature"
         if temperature >= rules["temperature_on"]
@@ -624,19 +626,21 @@ def forecast_latest(latest, regressor, classifier, rules):
         else "normal"
     )
 
-    air_quality_risk = (
-        "poor_air_quality"
-        if mq135 >= rules["air_quality_on"]
-        else "normal"
-    )
+    # IMPORTANT:
+    # predicted_air_quality is the NUMERIC predicted MQ-135 value.
+    # Do NOT create/store an "air_quality_risk" column.
+    # The air-quality risk is already represented by prediction_status
+    # and can be determined from the model rules.
 
     return {
         "prediction_for": prediction_for.isoformat(),
 
+        # These are the actual predicted sensor values
         "predicted_temperature": round(temperature, 2),
         "predicted_humidity": round(humidity, 2),
         "predicted_air_quality": round(mq135, 2),
 
+        # Overall prediction/risk
         "prediction_status": status,
         "prediction_score": (
             round(confidence, 6)
@@ -644,9 +648,9 @@ def forecast_latest(latest, regressor, classifier, rules):
             else None
         ),
 
+        # Individual temperature/humidity risk indicators
         "temperature_risk": temperature_risk,
         "humidity_risk": humidity_risk,
-        "air_quality_risk": air_quality_risk,
     }
 
 def fetch_storage_column_id(storage_no):
@@ -688,12 +692,34 @@ def save_prediction(latest, forecast, model_version):
         "sensor_reading_id": int(latest["id"]),
         "storage_no": storage_no,
 
+        # Current sensor readings
         "temperature": float(latest["temperature"]),
         "humidity": float(latest["humidity"]),
         "mq135_raw": float(latest["mq135_raw"]),
 
-        **forecast,
+        # 10-minute Random Forest predictions
+        "predicted_temperature": float(
+            forecast["predicted_temperature"]
+        ),
+        "predicted_humidity": float(
+            forecast["predicted_humidity"]
+        ),
+        "predicted_air_quality": float(
+            forecast["predicted_air_quality"]
+        ),
 
+        # Prediction result
+        "prediction_status": forecast["prediction_status"],
+        "prediction_score": forecast["prediction_score"],
+
+        # Individual risk indicators
+        "temperature_risk": forecast["temperature_risk"],
+        "humidity_risk": forecast["humidity_risk"],
+
+        # Forecast timestamp
+        "prediction_for": forecast["prediction_for"],
+
+        # Model version
         "model_version": model_version,
     }
 
@@ -725,9 +751,9 @@ def save_prediction(latest, forecast, model_version):
 
     print(
         f"Storage {storage_no}: prediction saved "
-        f"(storage_column_id={storage_column_id})."
+        f"(storage_column_id={storage_column_id}, "
+        f"predicted_air_quality={forecast['predicted_air_quality']})"
     )
-
 
 # ------------------------------ Main run ---------------------------------
 
