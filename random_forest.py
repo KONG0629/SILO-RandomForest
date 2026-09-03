@@ -63,8 +63,8 @@ DEFAULT_RULES = {
     "temperature_off": 28.0,
     "humidity_on": 70.0,
     "humidity_off": 65.0,
-    "mq135_on": 1500.0,
-    "mq135_off": 1300.0,
+    "air_quality_on": 1500.0,
+    "air_quality_off": 1300.0,
 }
 
 HEADERS = {
