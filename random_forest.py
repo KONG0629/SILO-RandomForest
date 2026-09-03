@@ -421,20 +421,29 @@ def generate_model_rules(pairs):
             temperature_on = bounded(
                 risky["temperature"].quantile(0.25), 25.0, 30.0
             )
+        
             humidity_on = bounded(
                 risky["humidity"].quantile(0.25), 60.0, 70.0
             )
-            mq135_on = bounded(
+        
+            air_quality_on = bounded(
                 risky["mq135_raw"].quantile(0.25), 100.0, 4000.0
             )
+        
             rules = {
                 "temperature_on": temperature_on,
                 "temperature_off": temperature_on - 2.0,
+        
                 "humidity_on": humidity_on,
                 "humidity_off": humidity_on - 5.0,
-                "mq135_on": mq135_on,
-                "mq135_off": mq135_on - max(50.0, mq135_on * 0.10),
+        
+                "air_quality_on": air_quality_on,
+                "air_quality_off": air_quality_on - max(
+                    50.0,
+                    air_quality_on * 0.10
+                ),
             }
+        
             source = "random_forest"
 
         rules["source"] = source
@@ -528,7 +537,7 @@ def risk_from_values(temperature, humidity, mq135, rules):
         risks.append("high_temperature")
     if humidity >= rules["humidity_on"]:
         risks.append("high_humidity")
-    if mq135 >= rules["mq135_on"]:
+    if mq135 >= rules["air_quality_on"]:
         risks.append("poor_air_quality")
 
     count = len(risks)
@@ -590,9 +599,9 @@ def forecast_latest(latest, regressor, classifier, rules):
         else "normal"
     )
 
-    mq135_risk = (
+    air_quality_risk = (
         "poor_air_quality"
-        if mq135 >= rules["mq135_on"]
+        if mq135 >= rules["air_quality_on"]
         else "normal"
     )
 
@@ -601,7 +610,7 @@ def forecast_latest(latest, regressor, classifier, rules):
 
         "predicted_temperature": round(temperature, 2),
         "predicted_humidity": round(humidity, 2),
-        "predicted_mq135_raw": round(mq135, 2),
+        "predicted_air_quality": round(mq135, 2),
 
         "prediction_status": status,
         "prediction_score": (
@@ -612,7 +621,7 @@ def forecast_latest(latest, regressor, classifier, rules):
 
         "temperature_risk": temperature_risk,
         "humidity_risk": humidity_risk,
-        "mq135_risk": mq135_risk,
+        "air_quality_risk": air_quality_risk,
     }
 
 def fetch_storage_column_id(storage_no):
