@@ -453,31 +453,52 @@ def generate_model_rules(pairs):
 
 def publish_model_rules(rules_by_storage, metrics, model_version):
     for storage_no, rule_with_source in rules_by_storage.items():
+
+        # Get the real primary-key ID from storage_columns.
+        storage_column_id = fetch_storage_column_id(storage_no)
+
         rules = {
             key: round(float(value), 2)
             for key, value in rule_with_source.items()
             if key != "source"
         }
+
         payload = {
             "device_id": DEVICE_ID,
+
+            # IMPORTANT:
+            # model_rules must receive the actual storage_columns.id
+            "storage_column_id": storage_column_id,
+
             "storage_no": storage_no,
             "model_version": model_version,
+
             **rules,
+
             "accuracy": metrics["accuracy"],
             "prediction_type": "risk_classification",
             "is_active": True,
+
             "notes": (
                 f"source={rule_with_source['source']}; "
                 f"macro_f1={metrics['macro_f1']}"
             ),
         }
-        # Insert first, so a failed insert never leaves the ESP32 without a rule.
+
+        print(
+            f"Storage {storage_no}: publishing model rule "
+            f"with storage_column_id={storage_column_id}"
+        )
+
+        # Insert the new active rule first.
         supabase_request(
             "POST",
             MODEL_RULES_TABLE,
             payload=payload,
             prefer="return=representation",
         )
+
+        # Deactivate previous rules for this storage.
         supabase_request(
             "PATCH",
             MODEL_RULES_TABLE,
@@ -489,7 +510,11 @@ def publish_model_rules(rules_by_storage, metrics, model_version):
             },
             payload={"is_active": False},
         )
-        print(f"Storage {storage_no}: model rule published.")
+
+        print(
+            f"Storage {storage_no}: model rule published "
+            f"(storage_column_id={storage_column_id})."
+        )
 
 
 def fetch_latest_sensor_reading(storage_no):
