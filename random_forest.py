@@ -717,8 +717,9 @@ def save_prediction(latest, forecast, model_version):
         "humidity_risk": forecast["humidity_risk"],
 
         # Forecast timestamp
+        "prediction_horizon_minutes": FORECAST_MINUTES,
         "prediction_for": forecast["prediction_for"],
-
+        
         # Model version
         "model_version": model_version,
     }
