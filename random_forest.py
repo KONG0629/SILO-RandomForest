@@ -627,9 +627,33 @@ def forecast_latest(latest, regressor, classifier, rules):
     )
 
     # Individual risk indicators
-    temperature_risk = temperature >= rules["temperature_on"]
-    humidity_risk = humidity >= rules["humidity_on"]
-    mq135_risk = mq135 >= rules["air_quality_on"]
+    # Individual risk indicators
+    def individual_risk(value, warning_threshold, critical_threshold):
+        if value >= critical_threshold:
+            return "critical"
+        elif value >= warning_threshold:
+            return "warning"
+        else:
+            return "safe"
+    
+    
+    temperature_risk = individual_risk(
+        temperature,
+        rules["temperature_off"],
+        rules["temperature_on"],
+    )
+    
+    humidity_risk = individual_risk(
+        humidity,
+        rules["humidity_off"],
+        rules["humidity_on"],
+    )
+    
+    mq135_risk = individual_risk(
+        mq135,
+        rules["air_quality_off"],
+        rules["air_quality_on"],
+    )
 
     # IMPORTANT:
     # predicted_air_quality is the NUMERIC predicted MQ-135 value.
