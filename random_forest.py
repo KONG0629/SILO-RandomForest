@@ -8,6 +8,7 @@ import os
 import sys
 import warnings
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from urllib.parse import urlparse
 
 import numpy as np
@@ -451,7 +452,7 @@ def generate_model_rules(pairs):
     return rules_by_storage
 
 
-def publish_model_rules(rules_by_storage, metrics, model_version):
+def _model_rules(rules_by_storage, metrics, model_version):
     for storage_no, rule_with_source in rules_by_storage.items():
 
         # Get the real primary-key ID from storage_columns.
@@ -536,6 +537,13 @@ def fetch_latest_sensor_reading(storage_no):
         return None
 
     latest = rows[0]
+
+    print(
+        f"Storage {storage_no}: "
+        f"latest sensor ID={latest.get('id')}, "
+        f"created_at={latest.get('created_at')}"
+    )
+    
     latest_time = pd.to_datetime(
         latest.get("created_at"), utc=True, errors="coerce"
     )
@@ -543,7 +551,12 @@ def fetch_latest_sensor_reading(storage_no):
         return None
     age = (pd.Timestamp.now(tz="UTC") - latest_time).total_seconds() / 60
     if age > MAX_LATEST_AGE_MINUTES:
-        print(f"Storage {storage_no}: latest reading is {age:.1f} minutes old.")
+        print(
+            f"Storage {storage_no}: latest sensor reading is "
+            f"{age:.1f} minutes old "
+            f"(created_at={latest.get('created_at')}). "
+            f"Maximum allowed age is {MAX_LATEST_AGE_MINUTES} minutes."
+        )
         return None
 
     previous = rows[1] if len(rows) > 1 else latest
@@ -689,6 +702,23 @@ def save_prediction(latest, forecast, model_version):
     # Time when this prediction is created/saved
     created_at = datetime.now(timezone.utc)
 
+    prediction_for = pd.to_datetime(
+        forecast["prediction_for"],
+        utc=True,
+    )
+    
+    print(
+        f"Storage {storage_no}: "
+        f"created_at={created_at.isoformat()}, "
+        f"prediction_for={prediction_for.isoformat()}, "
+        f"sensor_reading_id={latest['id']}"
+    )
+
+    print(
+        f"Prediction created_at (UTC): "
+        f"{created_at.isoformat()}"
+    )
+
     payload = {
         "device_id": DEVICE_ID,
         "storage_column_id": storage_column_id,
@@ -722,7 +752,7 @@ def save_prediction(latest, forecast, model_version):
         # Forecast information
         "prediction_horizon_minutes": FORECAST_MINUTES,
         "created_at": created_at.isoformat(),
-        "prediction_for": forecast["prediction_for"],
+        "prediction_for": prediction_for.isoformat(),
 
         # Model version
         "model_version": model_version,
@@ -764,8 +794,17 @@ def save_prediction(latest, forecast, model_version):
 
 def run_pipeline():
     started = datetime.now(timezone.utc)
+    philippines_time = started.astimezone(
+        ZoneInfo("Asia/Manila")
+    )
+
+    print("=" * 60)
+    print("S.I.L.O. CURRENT TIME CHECK")
+    print(f"UTC time: {started.isoformat()}")
+    print(f"Philippine time: {philippines_time.isoformat()}")
+    print("=" * 60)
+
     model_version = "RF10M_" + started.strftime("%Y%m%d_%H%M%S")
-    print(f"S.I.L.O. Random Forest run: {model_version}")
 
     raw = fetch_sensor_data()
     if raw.empty:
@@ -792,22 +831,83 @@ def run_pipeline():
     regressor, classifier, metrics = train_models(pairs)
     rules_by_storage = generate_model_rules(pairs)
 
-    publish_model_rules(rules_by_storage, metrics, model_version)
+    try:
+        publish_model_rules(rules_by_storage, metrics, model_version)
+    except Exception as error:
+        print(
+            f"WARNING: model_rules publishing failed: {error}",
+            file=sys.stderr,
+        )
+        print(
+            "Continuing to prediction generation. "
+            "Predictions will still be attempted."
+        )    
 
     saved = 0
     for storage_no in STORAGE_NUMBERS:
+    print("=" * 60)
+    print(f"PROCESSING STORAGE {storage_no}")
+    print("=" * 60)
+
+    try:
         latest = fetch_latest_sensor_reading(storage_no)
+
         if latest is None:
-            print(f"Storage {storage_no}: no fresh valid reading; skipped.")
+            print(
+                f"Storage {storage_no}: "
+                "no fresh valid reading; skipped."
+            )
             continue
+
+        print(
+            f"Storage {storage_no}: latest sensor reading "
+            f"id={latest['id']}, "
+            f"created_at={latest['created_at']}"
+        )
+
+        print(
+            f"Storage {storage_no}: generating "
+            f"{FORECAST_MINUTES}-minute forecast..."
+        )
+
         forecast = forecast_latest(
             latest,
             regressor,
             classifier,
             rules_by_storage[storage_no],
         )
-        save_prediction(latest, forecast, model_version)
+
+        print(
+            f"Storage {storage_no}: forecast generated: "
+            f"temperature={forecast['predicted_temperature']}, "
+            f"humidity={forecast['predicted_humidity']}, "
+            f"air_quality={forecast['predicted_air_quality']}, "
+            f"status={forecast['prediction_status']}, "
+            f"prediction_for={forecast['prediction_for']}"
+        )
+
+        print(
+            f"Storage {storage_no}: saving prediction..."
+        )
+
+        save_prediction(
+            latest,
+            forecast,
+            model_version,
+        )
+
         saved += 1
+
+        print(
+            f"Storage {storage_no}: SUCCESS"
+        )
+
+    except Exception as error:
+        print(
+            f"Storage {storage_no}: prediction failed: {error}",
+            file=sys.stderr,
+        )
+        continue
 
     print(
         f"Completed: {len(pairs)} pairs, {saved} predictions, "
