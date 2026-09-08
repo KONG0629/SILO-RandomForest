@@ -627,17 +627,9 @@ def forecast_latest(latest, regressor, classifier, rules):
     )
 
     # Individual risk indicators
-    temperature_risk = (
-        "high_temperature"
-        if temperature >= rules["temperature_on"]
-        else "normal"
-    )
-
-    humidity_risk = (
-        "high_humidity"
-        if humidity >= rules["humidity_on"]
-        else "normal"
-    )
+    temperature_risk = temperature >= rules["temperature_on"]
+    humidity_risk = humidity >= rules["humidity_on"]
+    mq135_risk = mq135 >= rules["air_quality_on"]
 
     # IMPORTANT:
     # predicted_air_quality is the NUMERIC predicted MQ-135 value.
@@ -647,23 +639,21 @@ def forecast_latest(latest, regressor, classifier, rules):
 
     return {
         "prediction_for": prediction_for.isoformat(),
-
-        # These are the actual predicted sensor values
+    
         "predicted_temperature": round(temperature, 2),
         "predicted_humidity": round(humidity, 2),
         "predicted_air_quality": round(mq135, 2),
-
-        # Overall prediction/risk
+    
         "prediction_status": status,
         "prediction_score": (
             round(confidence, 6)
             if confidence is not None
             else None
         ),
-
-        # Individual temperature/humidity risk indicators
+    
         "temperature_risk": temperature_risk,
         "humidity_risk": humidity_risk,
+        "mq135_risk": mq135_risk,
     }
 
 def fetch_storage_column_id(storage_no):
@@ -748,6 +738,7 @@ def save_prediction(latest, forecast, model_version):
         # Individual risk indicators
         "temperature_risk": forecast["temperature_risk"],
         "humidity_risk": forecast["humidity_risk"],
+        "mq135_risk": forecast["mq135_risk"],
 
         # Forecast information
         "prediction_horizon_minutes": FORECAST_MINUTES,
