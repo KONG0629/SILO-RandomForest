@@ -686,6 +686,9 @@ def save_prediction(latest, forecast, model_version):
     # Get the real primary-key ID from storage_columns.
     storage_column_id = fetch_storage_column_id(storage_no)
 
+    # Time when this prediction is created/saved
+    created_at = datetime.now(timezone.utc)
+
     payload = {
         "device_id": DEVICE_ID,
         "storage_column_id": storage_column_id,
@@ -716,10 +719,11 @@ def save_prediction(latest, forecast, model_version):
         "temperature_risk": forecast["temperature_risk"],
         "humidity_risk": forecast["humidity_risk"],
 
-        # Forecast timestamp
+        # Forecast information
         "prediction_horizon_minutes": FORECAST_MINUTES,
+        "created_at": created_at.isoformat(),
         "prediction_for": forecast["prediction_for"],
-        
+
         # Model version
         "model_version": model_version,
     }
