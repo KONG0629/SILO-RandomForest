@@ -845,69 +845,69 @@ def run_pipeline():
 
     saved = 0
     for storage_no in STORAGE_NUMBERS:
-    print("=" * 60)
-    print(f"PROCESSING STORAGE {storage_no}")
-    print("=" * 60)
-
-    try:
-        latest = fetch_latest_sensor_reading(storage_no)
-
-        if latest is None:
+        print("=" * 60)
+        print(f"PROCESSING STORAGE {storage_no}")
+        print("=" * 60)
+    
+        try:
+            latest = fetch_latest_sensor_reading(storage_no)
+    
+            if latest is None:
+                print(
+                    f"Storage {storage_no}: "
+                    "no fresh valid reading; skipped."
+                )
+                continue
+    
             print(
-                f"Storage {storage_no}: "
-                "no fresh valid reading; skipped."
+                f"Storage {storage_no}: latest sensor reading "
+                f"id={latest['id']}, "
+                f"created_at={latest['created_at']}"
+            )
+    
+            print(
+                f"Storage {storage_no}: generating "
+                f"{FORECAST_MINUTES}-minute forecast..."
+            )
+    
+            forecast = forecast_latest(
+                latest,
+                regressor,
+                classifier,
+                rules_by_storage[storage_no],
+            )
+    
+            print(
+                f"Storage {storage_no}: forecast generated: "
+                f"temperature={forecast['predicted_temperature']}, "
+                f"humidity={forecast['predicted_humidity']}, "
+                f"air_quality={forecast['predicted_air_quality']}, "
+                f"status={forecast['prediction_status']}, "
+                f"prediction_for={forecast['prediction_for']}"
+            )
+    
+            print(
+                f"Storage {storage_no}: saving prediction..."
+            )
+    
+            save_prediction(
+                latest,
+                forecast,
+                model_version,
+            )
+    
+            saved += 1
+    
+            print(
+                f"Storage {storage_no}: SUCCESS"
+            )
+    
+        except Exception as error:
+            print(
+                f"Storage {storage_no}: prediction failed: {error}",
+                file=sys.stderr,
             )
             continue
-
-        print(
-            f"Storage {storage_no}: latest sensor reading "
-            f"id={latest['id']}, "
-            f"created_at={latest['created_at']}"
-        )
-
-        print(
-            f"Storage {storage_no}: generating "
-            f"{FORECAST_MINUTES}-minute forecast..."
-        )
-
-        forecast = forecast_latest(
-            latest,
-            regressor,
-            classifier,
-            rules_by_storage[storage_no],
-        )
-
-        print(
-            f"Storage {storage_no}: forecast generated: "
-            f"temperature={forecast['predicted_temperature']}, "
-            f"humidity={forecast['predicted_humidity']}, "
-            f"air_quality={forecast['predicted_air_quality']}, "
-            f"status={forecast['prediction_status']}, "
-            f"prediction_for={forecast['prediction_for']}"
-        )
-
-        print(
-            f"Storage {storage_no}: saving prediction..."
-        )
-
-        save_prediction(
-            latest,
-            forecast,
-            model_version,
-        )
-
-        saved += 1
-
-        print(
-            f"Storage {storage_no}: SUCCESS"
-        )
-
-    except Exception as error:
-        print(
-            f"Storage {storage_no}: prediction failed: {error}",
-            file=sys.stderr,
-        )
-        continue
 
     print(
         f"Completed: {len(pairs)} pairs, {saved} predictions, "
