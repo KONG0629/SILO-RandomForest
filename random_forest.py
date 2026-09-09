@@ -62,7 +62,7 @@ RISK_ORDER = {"safe": 0, "warning": 1, "critical": 2}
 DEFAULT_RULES = {
     "temperature_on": 30.0,
     "temperature_off": 28.0,
-    "humidity_on": 70.0,
+    "humidity_on": 75.0,
     "humidity_off": 65.0,
     "air_quality_on": 1500.0,
     "air_quality_off": 1300.0,
@@ -452,7 +452,7 @@ def generate_model_rules(pairs):
     return rules_by_storage
 
 
-def _model_rules(rules_by_storage, metrics, model_version):
+def publish_model_rules(rules_by_storage, metrics, model_version):
     for storage_no, rule_with_source in rules_by_storage.items():
 
         # Get the real primary-key ID from storage_columns.
